@@ -1,0 +1,187 @@
+# handlers/cat.py — CAT Test handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.test_service import (
+    CATSession, generate_cat_question, save_test_result, get_test_history,
+)
+from keyboards import cat_menu, quiz_options_keyboard, back_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+SECTION_MAP = {
+    "cat_full": "grammar",
+    "cat_grammar": "grammar",
+    "cat_vocabulary": "vocabulary",
+    "cat_reading": "reading",
+    "cat_logic": "logic",
+    "cat_placement": "grammar",
+}
+
+
+class CATStates(StatesGroup):
+    in_test = State()
+
+
+@router.message(F.text == "🧪 CAT Test")
+async def show_cat_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🧪 *CAT Test*", parse_mode="Markdown", reply_markup=cat_menu())
+
+
+@router.callback_query(F.data.in_({
+    "cat_full", "cat_grammar", "cat_vocabulary",
+    "cat_reading", "cat_logic", "cat_placement",
+}))
+async def start_cat_test(callback: CallbackQuery, state: FSMContext):
+    section = SECTION_MAP.get(callback.data, "grammar")
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+    
+    session = CATSession(section=section, user_level=user.current_level)
+    await state.update_data(
+        cat_session=session.__dict__,
+        cat_section=section,
+    )
+    await state.set_state(CATStates.in_test)
+
+    await callback.message.edit_text(
+        f"🧪 *CAT Test — {section.title()}*\n\n"
+        f"Test {session.max_questions} ta savoldan iborat.\n"
+        f"Har bir to'g'ri javob keyingi savolni qiyinlashtiradi.\n\n"
+        f"Boshlaymizmi? 🚀",
+        parse_mode="Markdown",
+    )
+
+    await _send_next_cat_question(callback.message, state, user, session)
+    await callback.answer()
+
+
+async def _send_next_cat_question(message, state, user, session: CATSession):
+    """Keyingi CAT savolini yuboradi."""
+    try:
+        question = await generate_cat_question(
+            section=session.section,
+            difficulty=session.current_difficulty,
+            level=user.current_level,
+            user_id=user.id,
+        )
+        options = question.get("options", ["A", "B", "C", "D"])
+        
+        await state.update_data(
+            current_question=question,
+            cat_session=session.__dict__,
+        )
+
+        q_num = session.questions_asked + 1
+        await message.answer(
+            f"❓ *Savol {q_num}/{session.max_questions}*\n"
+            f"(Qiyinlik: {session.current_difficulty}/10)\n\n"
+            f"{question.get('question', 'Question')}",
+            parse_mode="Markdown",
+            reply_markup=quiz_options_keyboard(options, q_num),
+        )
+    except Exception as e:
+        logger.error(f"CAT question error: {e}")
+        await message.answer("❌ Savol yaratishda xatolik. Test to'xtatildi.")
+        await state.clear()
+
+
+@router.callback_query(CATStates.in_test, F.data.startswith("quiz_answer:"))
+async def handle_cat_answer(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    chosen_index = int(parts[2]) if len(parts) > 2 else 0
+
+    data = await state.get_data()
+    question = data.get("current_question", {})
+    session_data = data.get("cat_session", {})
+
+    options = question.get("options", [])
+    correct_answer = question.get("correct_answer", "A")
+    explanation = question.get("explanation", "")
+
+    # To'g'ri javobni tekshirish
+    chosen_option = options[chosen_index] if chosen_index < len(options) else ""
+    is_correct = chosen_option.startswith(correct_answer)
+
+    # Session yangilash
+    session = CATSession.__new__(CATSession)
+    session.__dict__.update(session_data)
+    session.update(is_correct, question)
+
+    feedback = "✅ To'g'ri!" if is_correct else f"❌ Noto'g'ri. To'g'ri: *{correct_answer}*"
+    if explanation:
+        feedback += f"\n💡 {explanation}"
+
+    await callback.message.edit_text(
+        f"{feedback}",
+        parse_mode="Markdown",
+    )
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    if session.is_finished():
+        # Test tugadi
+        final = session.get_final_result()
+        final["feedback"] = f"Test yakunlandi. {final['correct']}/{final['total_questions']} to'g'ri."
+        
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, callback.from_user)
+            await save_test_result(db, user, final, "CAT")
+
+        result_text = f"""🏁 *CAT Test Yakunlandi!*
+{'─' * 35}
+📊 *Natija:* {final['score_percent']}%
+✅ To'g'ri: {final['correct']}/{final['total_questions']}
+
+🎯 *Taxminiy daraja:*
+CEFR: *{final['estimated_cefr']}*
+IELTS: *{final['estimated_ielts']}*
+
+📈 Keyingi mashqlar uchun IELTS yoki CEFR bo'limiga o'ting!"""
+
+        await callback.message.answer(
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=cat_menu(),
+        )
+        await state.clear()
+    else:
+        await _send_next_cat_question(callback.message, state, user, session)
+
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cat_history")
+async def show_cat_history(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        history = await get_test_history(db, user, "CAT")
+
+    if not history:
+        await callback.message.edit_text(
+            "📜 Hali CAT tarixi yo'q.",
+            reply_markup=back_keyboard("back_main"),
+        )
+        await callback.answer()
+        return
+
+    text = "📜 *CAT Test tarixi:*\n\n"
+    for t in history:
+        date = t.created_at.strftime("%d.%m.%Y")
+        text += f"📅 {date}: {t.score}% | CEFR: {t.estimated_level}\n"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_main"),
+    )
+    await callback.answer()

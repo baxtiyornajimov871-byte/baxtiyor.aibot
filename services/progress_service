@@ -1,0 +1,146 @@
+# services/progress_service.py — Progress kuzatuv
+import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from models import User, WritingAttempt, SpeakingAttempt, TestResult, VocabularyWord
+from ai_router import ai_router
+from prompts import get_progress_analysis_prompt
+
+logger = logging.getLogger(__name__)
+
+
+async def get_progress_data(db: AsyncSession, user: User) -> dict:
+    """Foydalanuvchining to'liq progress ma'lumotlarini to'playdi."""
+    
+    # Writing history
+    writing = await db.execute(
+        select(WritingAttempt)
+        .where(WritingAttempt.user_id == user.id)
+        .order_by(WritingAttempt.created_at.asc())
+        .limit(10)
+    )
+    writing_list = writing.scalars().all()
+    writing_scores = [
+        {"score": w.estimated_score, "date": w.created_at.strftime("%d.%m.%Y"), "type": w.task_type}
+        for w in writing_list if w.estimated_score
+    ]
+
+    # Speaking history
+    speaking = await db.execute(
+        select(SpeakingAttempt)
+        .where(SpeakingAttempt.user_id == user.id)
+        .order_by(SpeakingAttempt.created_at.asc())
+        .limit(10)
+    )
+    speaking_list = speaking.scalars().all()
+    speaking_scores = [
+        {"score": s.estimated_score, "date": s.created_at.strftime("%d.%m.%Y")}
+        for s in speaking_list if s.estimated_score
+    ]
+
+    # Test results
+    tests = await db.execute(
+        select(TestResult)
+        .where(TestResult.user_id == user.id)
+        .order_by(TestResult.created_at.desc())
+        .limit(10)
+    )
+    test_list = tests.scalars().all()
+
+    # Vocab count
+    vocab_count_result = await db.execute(
+        select(func.count(VocabularyWord.id)).where(VocabularyWord.user_id == user.id)
+    )
+    vocab_count = vocab_count_result.scalar_one()
+
+    return {
+        "writing_scores": writing_scores,
+        "speaking_scores": speaking_scores,
+        "test_results": [
+            {
+                "type": t.test_type,
+                "score": t.score,
+                "level": t.estimated_level,
+                "date": t.created_at.strftime("%d.%m.%Y"),
+            }
+            for t in test_list
+        ],
+        "vocab_count": vocab_count,
+        "writing_history": [s["score"] for s in writing_scores],
+        "speaking_history": [s["score"] for s in speaking_scores],
+    }
+
+
+async def generate_progress_report(db: AsyncSession, user: User) -> str:
+    """AI bilan progress hisobotini yaratadi."""
+    data = await get_progress_data(db, user)
+
+    user_dict = {
+        "first_name": user.first_name,
+        "target_exam": user.target_exam,
+        "target_score": user.target_score,
+        "current_level": user.current_level,
+        "weak_areas": user.weak_areas,
+        "strong_areas": user.strong_areas,
+        "writing_history": data["writing_history"],
+        "speaking_history": data["speaking_history"],
+    }
+
+    prompt = get_progress_analysis_prompt(user_dict)
+    response = await ai_router.chat(
+        [{"role": "user", "content": prompt}],
+        mode="strong",
+        user_id=user.id,
+    )
+    return response
+
+
+def format_progress_text(data: dict, user: User) -> str:
+    """Progress ma'lumotlarini chiroyli formatda."""
+    writing = data.get("writing_scores", [])
+    speaking = data.get("speaking_scores", [])
+    vocab = data.get("vocab_count", 0)
+
+    # Writing trend
+    if writing:
+        w_scores = [str(s["score"]) for s in writing]
+        w_trend = " → ".join(w_scores)
+        w_last = writing[-1]["score"]
+    else:
+        w_trend = "Hali mavjud emas"
+        w_last = None
+
+    # Speaking trend
+    if speaking:
+        s_scores = [str(s["score"]) for s in speaking]
+        s_trend = " → ".join(s_scores)
+        s_last = speaking[-1]["score"]
+    else:
+        s_trend = "Hali mavjud emas"
+        s_last = None
+
+    text = f"""📈 *Mening Progressim*
+{'─' * 35}
+👤 *Ism:* {user.first_name}
+🎯 *Maqsad:* {user.target_exam} {user.target_score}
+📊 *Hozirgi daraja:* {user.current_level}
+
+📝 *Writing scores:*
+{w_trend}
+"""
+    if w_last:
+        text += f"  Son'ggi: *{w_last}*/9.0\n"
+
+    text += f"\n🗣 *Speaking scores:*\n{s_trend}\n"
+    if s_last:
+        text += f"  So'nggi: *{s_last}*/9.0\n"
+
+    text += f"\n📚 *Saqlangan so'zlar:* {vocab} ta\n"
+
+    if user.weak_areas:
+        text += f"\n⚠️ *Zaif tomonlar:*\n{user.weak_areas}\n"
+
+    if user.strong_areas:
+        text += f"\n✅ *Kuchli tomonlar:*\n{user.strong_areas}\n"
+
+    return text

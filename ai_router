@@ -1,0 +1,182 @@
+# ai_router.py — 3 ta API key bilan AI Router tizimi
+import asyncio
+import logging
+import json
+import random
+from typing import Optional
+import httpx
+from config import config
+from models import UsageLog
+from database import AsyncSessionLocal
+
+logger = logging.getLogger(__name__)
+
+
+class AIRouter:
+    """
+    3 ta API key bilan ishlaydi:
+    - Failover: 1 → 2 → 3
+    - Load balancing: random taqsimot
+    - Strong mode: eng kuchli modelni ishlatadi
+    """
+
+    def __init__(self):
+        self.api_keys = [
+            k for k in [
+                config.AI_API_KEY_1,
+                config.AI_API_KEY_2,
+                config.AI_API_KEY_3,
+            ] if k
+        ]
+        self.base_url = config.AI_BASE_URL
+        self.current_key_index = 0
+
+        if not self.api_keys:
+            logger.warning("⚠️ No AI API keys configured!")
+
+    def _get_model(self, mode: str) -> str:
+        models = {
+            "fast": config.AI_MODEL_FAST,
+            "strong": config.AI_MODEL_STRONG,
+            "economy": config.AI_MODEL_CHEAP,
+        }
+        return models.get(mode, config.AI_MODEL_FAST)
+
+    def _next_key_round_robin(self) -> Optional[str]:
+        if not self.api_keys:
+            return None
+        key = self.api_keys[self.current_key_index % len(self.api_keys)]
+        self.current_key_index += 1
+        return key
+
+    def _random_key(self) -> Optional[str]:
+        if not self.api_keys:
+            return None
+        return random.choice(self.api_keys)
+
+    async def _call_api(
+        self,
+        api_key: str,
+        messages: list[dict],
+        model: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.7,
+        json_mode: bool = False,
+    ) -> str:
+        """OpenAI-compatible API chaqirish."""
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            return content, tokens
+
+    async def chat(
+        self,
+        messages: list[dict],
+        mode: str = "fast",
+        user_id: Optional[int] = None,
+        json_mode: bool = False,
+        max_tokens: int = 2000,
+    ) -> str:
+        """
+        Failover bilan AI chaqirish.
+        Har bir key ishlamasa, keyingisiga o'tadi.
+        """
+        model = self._get_model(mode)
+        errors = []
+
+        for attempt, api_key in enumerate(self.api_keys):
+            key_label = f"key_{attempt+1}"
+            try:
+                content, tokens = await self._call_api(
+                    api_key, messages, model,
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                )
+                await self._log_usage(user_id, "chat", tokens, key_label, "success")
+                return content
+
+            except httpx.HTTPStatusError as e:
+                err_msg = f"Key {attempt+1} HTTP error: {e.response.status_code}"
+                logger.warning(err_msg)
+                errors.append(err_msg)
+                await self._log_usage(user_id, "chat", 0, key_label, "error", str(e))
+
+            except Exception as e:
+                err_msg = f"Key {attempt+1} error: {str(e)}"
+                logger.warning(err_msg)
+                errors.append(err_msg)
+                await self._log_usage(user_id, "chat", 0, key_label, "error", str(e))
+
+        logger.error(f"All API keys failed: {errors}")
+        raise Exception("Barcha API kalitlar ishlamadi. Keyinroq urinib ko'ring.")
+
+    async def chat_strong(
+        self,
+        messages: list[dict],
+        user_id: Optional[int] = None,
+        json_mode: bool = False,
+    ) -> str:
+        """Kuchli model bilan chaqirish (evaluation uchun)."""
+        return await self.chat(messages, mode="strong", user_id=user_id, json_mode=json_mode, max_tokens=3000)
+
+    async def parse_json_response(self, response: str) -> dict:
+        """AI javobidan JSON parse qiladi."""
+        try:
+            # Markdown code block tozalash
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                cleaned = "\n".join(lines[1:-1])
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}\nResponse: {response[:500]}")
+            raise ValueError(f"AI javobni parse qilib bo'lmadi: {e}")
+
+    async def _log_usage(
+        self,
+        user_id: Optional[int],
+        action: str,
+        tokens: int,
+        api_key: str,
+        status: str,
+        error: str = None,
+    ):
+        """Usage logini saqlaydi."""
+        try:
+            async with AsyncSessionLocal() as db:
+                log = UsageLog(
+                    user_id=user_id,
+                    action=action,
+                    tokens_used=tokens,
+                    api_key_used=api_key,
+                    status=status,
+                    error_message=error,
+                )
+                db.add(log)
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Log save error: {e}")
+
+
+# Global router instance
+ai_router = AIRouter()

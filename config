@@ -1,0 +1,44 @@
+# config.py — Environment variables va konfiguratsiya
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    # Telegram
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    
+    # Database
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
+    
+    # AI API Keys
+    AI_API_KEY_1: str = os.getenv("AI_API_KEY_1", "")
+    AI_API_KEY_2: str = os.getenv("AI_API_KEY_2", "")
+    AI_API_KEY_3: str = os.getenv("AI_API_KEY_3", "")
+    
+    # AI Models
+    AI_MODEL_FAST: str = os.getenv("AI_MODEL_FAST", "gpt-4o-mini")
+    AI_MODEL_STRONG: str = os.getenv("AI_MODEL_STRONG", "gpt-4o")
+    AI_MODEL_CHEAP: str = os.getenv("AI_MODEL_CHEAP", "gpt-3.5-turbo")
+    AI_BASE_URL: str = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+    
+    # STT / TTS
+    STT_API_KEY: str = os.getenv("STT_API_KEY", "")
+    TTS_API_KEY: str = os.getenv("TTS_API_KEY", "")
+    STT_PROVIDER: str = os.getenv("STT_PROVIDER", "openai")  # openai | google
+    TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "openai")  # openai | google
+    
+    # Admin
+    ADMIN_IDS: list[int] = [
+        int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
+        if x.strip().isdigit()
+    ]
+    
+    # Web App
+    WEB_APP_URL: str = os.getenv("WEB_APP_URL", "https://baxtiyor-ai.onrender.com/")
+    
+    # App settings
+    DEFAULT_LANGUAGE: str = os.getenv("DEFAULT_LANGUAGE", "uz")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+config = Config()

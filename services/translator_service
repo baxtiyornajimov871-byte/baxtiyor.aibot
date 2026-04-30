@@ -1,0 +1,137 @@
+# services/translator_service.py — Tarjima xizmati
+import logging
+import json
+import re
+from ai_router import ai_router
+from prompts import TRANSLATOR_PROMPT, VOCABULARY_EXPLAINER
+
+logger = logging.getLogger(__name__)
+
+
+def detect_language(text: str) -> str:
+    """Oddiy til aniqlash: lotin vs kirill va o'zbek harflari."""
+    # Kirill harflari
+    cyrillic = len(re.findall(r'[а-яА-ЯёЁ]', text))
+    # Lotin harflari
+    latin = len(re.findall(r'[a-zA-Z]', text))
+    
+    if cyrillic > latin:
+        return "ru"
+    
+    # O'zbekcha xarakterli so'zlar (lotin)
+    uz_words = ["va", "bilan", "uchun", "bu", "men", "sen", "ham", "lekin", "yoki"]
+    text_lower = text.lower()
+    uz_count = sum(1 for w in uz_words if f" {w} " in f" {text_lower} ")
+    
+    if uz_count >= 2 or any(c in text_lower for c in ["ø", "ə", "ğ", "ş"]):
+        return "uz"
+    
+    if latin > 3:
+        return "en"
+    
+    return "uz"  # Default
+
+
+async def translate_text(
+    text: str,
+    source_lang: str = "auto",
+    target_lang: str = "auto",
+    user_id: int = None,
+) -> dict:
+    """Matnni tarjima qiladi."""
+    if source_lang == "auto":
+        source_lang = detect_language(text)
+    
+    if target_lang == "auto":
+        target_lang = "uz" if source_lang == "en" else "en"
+
+    prompt = TRANSLATOR_PROMPT.format(
+        text=text,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    )
+
+    response = await ai_router.chat(
+        [{"role": "user", "content": prompt}],
+        mode="fast",
+        user_id=user_id,
+        json_mode=True,
+    )
+
+    result = await ai_router.parse_json_response(response)
+    return result
+
+
+async def explain_word(word: str, user_id: int = None) -> dict:
+    """So'zni batafsil tushuntiradi."""
+    prompt = VOCABULARY_EXPLAINER.format(word=word)
+
+    response = await ai_router.chat(
+        [{"role": "user", "content": prompt}],
+        mode="fast",
+        user_id=user_id,
+        json_mode=True,
+    )
+
+    result = await ai_router.parse_json_response(response)
+    return result
+
+
+def format_translation(result: dict) -> str:
+    """Tarjima natijasini chiroyli formatda."""
+    original = result.get("original", "")
+    translation = result.get("translation", "")
+    alternatives = result.get("alternative_translations", [])
+    notes = result.get("notes", "")
+
+    text = f"🔄 *Tarjima*\n\n"
+    text += f"📝 *Asl matn:* {original}\n"
+    text += f"🎯 *Tarjima:* {translation}\n"
+
+    if alternatives:
+        text += f"\n🔀 *Boshqa variantlar:*\n"
+        for alt in alternatives[:3]:
+            text += f"  • {alt}\n"
+
+    if notes:
+        text += f"\n💡 *Izoh:* {notes}"
+
+    return text
+
+
+def format_word_explanation(result: dict) -> str:
+    """So'z tushuntirishini chiroyli formatda."""
+    word = result.get("word", "")
+    translation = result.get("translation_uz", "")
+    pos = result.get("part_of_speech", "")
+    cefr = result.get("cefr_level", "")
+    ielts = result.get("ielts_usefulness", "")
+    definition = result.get("definition", "")
+    example_en = result.get("example_en", "")
+    example_uz = result.get("example_uz", "")
+    synonyms = result.get("synonyms", [])
+    mistake = result.get("common_mistakes", "")
+    pron_tip = result.get("pronunciation_tip", "")
+
+    text = f"📖 *{word}*\n"
+    text += f"🇺🇿 *Tarjima:* {translation}\n"
+    text += f"📝 *Tur:* {pos}\n"
+    if cefr:
+        text += f"🎯 *CEFR:* {cefr}"
+    if ielts:
+        text += f" | IELTS: {ielts}\n"
+    else:
+        text += "\n"
+    text += f"\n💡 *Ta'rif:* {definition}\n"
+    text += f"\n📌 *Misol:*\n_{example_en}_\n_{example_uz}_\n"
+
+    if synonyms:
+        text += f"\n🔀 *Sinonimlar:* {', '.join(synonyms)}\n"
+
+    if mistake:
+        text += f"\n⚠️ *Keng tarqalgan xato:* {mistake}\n"
+
+    if pron_tip:
+        text += f"\n🔊 *Talaffuz:* {pron_tip}\n"
+
+    return text

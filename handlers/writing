@@ -1,0 +1,182 @@
+# handlers/writing.py — IELTS Writing handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user, get_user_profile_dict
+from services.writing_service import (
+    evaluate_writing, generate_writing_topic,
+    get_writing_history, format_writing_result,
+)
+from keyboards import writing_menu, back_keyboard, main_menu_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class WritingStates(StatesGroup):
+    waiting_essay = State()
+    task_type = State()
+
+
+@router.message(F.text == "📝 Writing Practice")
+@router.callback_query(F.data == "ielts_writing")
+async def show_writing_menu(update, state: FSMContext):
+    await state.clear()
+    if isinstance(update, Message):
+        await update.answer("📝 *IELTS Writing*", parse_mode="Markdown", reply_markup=writing_menu())
+    else:
+        await update.message.edit_text("📝 *IELTS Writing*", parse_mode="Markdown", reply_markup=writing_menu())
+        await update.answer()
+
+
+@router.callback_query(F.data.in_({"writing_task1_academic", "writing_task1_general", "writing_task2"}))
+async def start_writing_task(callback: CallbackQuery, state: FSMContext):
+    task_map = {
+        "writing_task1_academic": "task1_academic",
+        "writing_task1_general": "task1_general",
+        "writing_task2": "task2",
+    }
+    task_type = task_map[callback.data]
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        profile = await get_user_profile_dict(user)
+
+    await state.update_data(task_type=task_type)
+    
+    # Topic yaratish
+    await callback.message.edit_text(f"⏳ Topic tayyorlanmoqda...")
+    topic = await generate_writing_topic(profile, task_type)
+    
+    type_names = {
+        "task1_academic": "Task 1 Academic",
+        "task1_general": "Task 1 General",
+        "task2": "Task 2 Essay",
+    }
+    
+    await state.update_data(topic=topic)
+    await state.set_state(WritingStates.waiting_essay)
+    
+    await callback.message.edit_text(
+        f"📝 *{type_names[task_type]}*\n\n"
+        f"📋 *Topik:*\n{topic}\n\n"
+        f"✍️ Essayingizni yozing va yuboring. "
+        f"(kamida 150 so'z bo'lishi tavsiya etiladi)",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "writing_check")
+async def writing_check_mode(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(task_type="task2", topic="User's own topic")
+    await state.set_state(WritingStates.waiting_essay)
+    await callback.message.edit_text(
+        "✅ *Essay tekshirish*\n\n"
+        "Essayingizni yuboring — IELTS mezonlari bo'yicha baholayman.",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "writing_topic")
+async def generate_topic_only(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        profile = await get_user_profile_dict(user)
+
+    await callback.message.edit_text("⏳ Topic tayyorlanmoqda...")
+    topic = await generate_writing_topic(profile, "task2")
+    
+    await callback.message.edit_text(
+        f"🎲 *Yangi Topic:*\n\n{topic}",
+        parse_mode="Markdown",
+        reply_markup=writing_menu(),
+    )
+    await callback.answer()
+
+
+@router.message(WritingStates.waiting_essay, F.text)
+async def receive_essay(message: Message, state: FSMContext):
+    essay = message.text
+    
+    if len(essay.split()) < 50:
+        await message.answer(
+            "⚠️ Essay juda qisqa (50 so'zdan kam). Iltimos, to'liqroq yozing."
+        )
+        return
+
+    data = await state.get_data()
+    task_type = data.get("task_type", "task2")
+    topic = data.get("topic", "")
+
+    await message.answer("⏳ Essay baholanmoqda... (20-30 soniya)")
+
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            result = await evaluate_writing(db, user, essay, task_type, topic)
+
+        text = format_writing_result(result, result.get("previous_score"))
+        await message.answer(text, parse_mode="Markdown")
+
+        # Yaxshilangan versiya
+        if result.get("improved_version"):
+            await message.answer(
+                f"✨ *Yaxshilangan versiya:*\n\n{result['improved_version'][:1500]}",
+                parse_mode="Markdown",
+            )
+
+        # Keyingi vazifa
+        if result.get("next_task"):
+            await message.answer(
+                f"📌 *Keyingi mashq:*\n{result['next_task']}",
+                parse_mode="Markdown",
+                reply_markup=writing_menu(),
+            )
+
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"Writing evaluation error: {e}")
+        await message.answer(
+            "❌ Baholashda xatolik yuz berdi. Iltimos, qayta urinib ko'ring.",
+            reply_markup=writing_menu(),
+        )
+        await state.clear()
+
+
+@router.callback_query(F.data == "writing_history")
+async def show_writing_history(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        history = await get_writing_history(db, user)
+
+    if not history:
+        await callback.message.edit_text(
+            "📜 Hali writing tarixi yo'q.",
+            reply_markup=back_keyboard("back_ielts"),
+        )
+        await callback.answer()
+        return
+
+    text = "📜 *Writing tarixi:*\n\n"
+    for i, attempt in enumerate(history, 1):
+        date = attempt.created_at.strftime("%d.%m.%Y")
+        text += (
+            f"{i}. {date} — {attempt.task_type}\n"
+            f"   🏆 Ball: {attempt.estimated_score}/9.0\n\n"
+        )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()

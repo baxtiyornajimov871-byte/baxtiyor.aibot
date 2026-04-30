@@ -1,0 +1,88 @@
+# services/admin_service.py — Admin panel xizmati
+import logging
+from datetime import datetime, timedelta
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from models import User, WritingAttempt, SpeakingAttempt, UsageLog, TestResult
+from config import config
+
+logger = logging.getLogger(__name__)
+
+
+def is_admin(telegram_id: int) -> bool:
+    return telegram_id in config.ADMIN_IDS
+
+
+async def get_stats(db: AsyncSession) -> dict:
+    """Statistika ma'lumotlarini to'playdi."""
+    # Jami foydalanuvchilar
+    total_users = await db.execute(select(func.count(User.id)))
+    total_users = total_users.scalar_one()
+
+    # Bugungi faol foydalanuvchilar
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    active_today = await db.execute(
+        select(func.count(User.id)).where(User.updated_at >= today_start)
+    )
+    active_today = active_today.scalar_one()
+
+    # So'nggi 7 kun
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    new_users_week = await db.execute(
+        select(func.count(User.id)).where(User.created_at >= week_ago)
+    )
+    new_users_week = new_users_week.scalar_one()
+
+    # Writing/Speaking urinishlar
+    total_writing = await db.execute(select(func.count(WritingAttempt.id)))
+    total_writing = total_writing.scalar_one()
+
+    total_speaking = await db.execute(select(func.count(SpeakingAttempt.id)))
+    total_speaking = total_speaking.scalar_one()
+
+    # API usage
+    total_api_calls = await db.execute(
+        select(func.count(UsageLog.id)).where(UsageLog.status == "success")
+    )
+    total_api_calls = total_api_calls.scalar_one()
+
+    total_tokens = await db.execute(
+        select(func.sum(UsageLog.tokens_used))
+    )
+    total_tokens = total_tokens.scalar_one() or 0
+
+    # Error logs
+    error_count = await db.execute(
+        select(func.count(UsageLog.id)).where(
+            UsageLog.status == "error",
+            UsageLog.created_at >= week_ago,
+        )
+    )
+    error_count = error_count.scalar_one()
+
+    return {
+        "total_users": total_users,
+        "active_today": active_today,
+        "new_users_week": new_users_week,
+        "total_writing": total_writing,
+        "total_speaking": total_speaking,
+        "total_api_calls": total_api_calls,
+        "total_tokens": total_tokens,
+        "error_count_week": error_count,
+    }
+
+
+def format_stats(stats: dict) -> str:
+    return f"""📊 *Admin Statistikasi*
+{'─' * 35}
+👥 Jami foydalanuvchilar: {stats['total_users']}
+🟢 Bugun faol: {stats['active_today']}
+🆕 So'nggi 7 kun yangilari: {stats['new_users_week']}
+
+📝 Jami writing urinishlar: {stats['total_writing']}
+🗣 Jami speaking urinishlar: {stats['total_speaking']}
+
+🤖 AI API chaqiruvlar: {stats['total_api_calls']}
+🪙 Jami tokenlar: {stats['total_tokens']:,}
+❌ Xatolar (7 kun): {stats['error_count_week']}
+"""

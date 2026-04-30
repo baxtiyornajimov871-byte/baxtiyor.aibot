@@ -1,0 +1,256 @@
+# handlers/ielts.py — IELTS asosiy handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.writing_service import get_writing_history
+from services.speaking_service import get_speaking_history
+from services.progress_service import get_progress_data, format_progress_text
+from ai_router import ai_router
+from keyboards import (
+    ielts_menu, writing_menu, speaking_menu,
+    listening_menu, reading_menu, back_keyboard,
+)
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class IELTSStates(StatesGroup):
+    listening_waiting = State()
+    reading_waiting = State()
+    reading_passage = State()
+
+
+@router.message(F.text == "📊 IELTS")
+async def show_ielts_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📊 *IELTS bo'limi*", parse_mode="Markdown", reply_markup=ielts_menu())
+
+
+@router.callback_query(F.data == "ielts_listening")
+async def show_listening_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "🎧 *IELTS Listening*",
+        parse_mode="Markdown",
+        reply_markup=listening_menu(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ielts_reading")
+async def show_reading_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "📖 *IELTS Reading*",
+        parse_mode="Markdown",
+        reply_markup=reading_menu(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_ielts")
+async def back_to_ielts(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "📊 *IELTS bo'limi*",
+        parse_mode="Markdown",
+        reply_markup=ielts_menu(),
+    )
+    await callback.answer()
+
+
+# ===== LISTENING =====
+@router.callback_query(F.data.in_({"listening_short", "listening_mcq", "listening_gap", "listening_dictation"}))
+async def start_listening(callback: CallbackQuery, state: FSMContext):
+    type_map = {
+        "listening_short": "short practice",
+        "listening_mcq": "multiple choice",
+        "listening_gap": "gap filling",
+        "listening_dictation": "dictation",
+    }
+    lt = type_map[callback.data]
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    await callback.message.edit_text("⏳ Listening mashqi tayyorlanmoqda...")
+
+    prompt = f"""Create an IELTS listening {lt} exercise.
+Generate a short passage (100-150 words) and 5 questions.
+Respond in this format:
+PASSAGE:
+[the passage text]
+
+QUESTIONS:
+1. [question]
+2. [question]
+...
+
+ANSWERS:
+1. [answer]
+2. [answer]
+...
+
+Keep it appropriate for B1-B2 level students."""
+
+    try:
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="fast",
+            user_id=user.id,
+        )
+        await state.update_data(listening_type=lt, answers=response)
+        await state.set_state(IELTSStates.listening_waiting)
+        
+        await callback.message.edit_text(
+            f"🎧 *IELTS Listening — {lt.title()}*\n\n{response}\n\n"
+            f"📝 Javoblaringizni yuboring (1-a, 2-b, 3-c shaklida)",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("ielts_listening"),
+        )
+    except Exception as e:
+        logger.error(f"Listening error: {e}")
+        await callback.message.edit_text(
+            "❌ Xatolik yuz berdi.",
+            reply_markup=listening_menu(),
+        )
+    await callback.answer()
+
+
+@router.message(IELTSStates.listening_waiting, F.text)
+async def check_listening_answers(message: Message, state: FSMContext):
+    data = await state.get_data()
+    exercise = data.get("answers", "")
+    user_answers = message.text
+
+    prompt = f"""Check these listening exercise answers:
+Exercise:
+{exercise}
+
+Student answers: {user_answers}
+
+Give score and feedback in Uzbek."""
+
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+        
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="fast",
+            user_id=user.id,
+        )
+        await message.answer(response, reply_markup=listening_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Listening check error: {e}")
+        await message.answer("❌ Tekshirishda xatolik.", reply_markup=listening_menu())
+        await state.clear()
+
+
+# ===== READING =====
+@router.callback_query(F.data.in_({"reading_tfng", "reading_mcq", "reading_matching", "reading_gap"}))
+async def start_reading(callback: CallbackQuery, state: FSMContext):
+    type_map = {
+        "reading_tfng": "True/False/Not Given",
+        "reading_mcq": "Multiple Choice",
+        "reading_matching": "Matching Headings",
+        "reading_gap": "Gap Filling",
+    }
+    rt = type_map[callback.data]
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    await callback.message.edit_text("⏳ Reading mashqi tayyorlanmoqda...")
+
+    prompt = f"""Create an IELTS reading {rt} exercise.
+Include: a 200-word passage and 5 questions of type {rt}.
+Format clearly with PASSAGE: and QUESTIONS: sections.
+Level: B1-B2."""
+
+    try:
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="fast",
+            user_id=user.id,
+        )
+        await state.update_data(reading_type=rt, passage_data=response)
+        await state.set_state(IELTSStates.reading_waiting)
+
+        await callback.message.edit_text(
+            f"📖 *IELTS Reading — {rt}*\n\n{response}\n\n"
+            f"📝 Javoblaringizni yuboring",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("ielts_reading"),
+        )
+    except Exception as e:
+        logger.error(f"Reading error: {e}")
+        await callback.message.edit_text("❌ Xatolik.", reply_markup=reading_menu())
+    await callback.answer()
+
+
+@router.message(IELTSStates.reading_waiting, F.text)
+async def check_reading_answers(message: Message, state: FSMContext):
+    data = await state.get_data()
+    exercise = data.get("passage_data", "")
+    user_answers = message.text
+
+    prompt = f"""Check reading answers:
+Exercise: {exercise}
+Student answers: {user_answers}
+Give detailed feedback in Uzbek."""
+
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="fast",
+            user_id=user.id,
+        )
+        await message.answer(response, reply_markup=reading_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Reading check error: {e}")
+        await message.answer("❌ Tekshirishda xatolik.", reply_markup=reading_menu())
+        await state.clear()
+
+
+@router.callback_query(F.data == "ielts_progress")
+async def show_ielts_progress(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        data = await get_progress_data(db, user)
+        text = format_progress_text(data, user)
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ielts_mock")
+async def start_mock_test(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📊 *To'liq IELTS Mock Test*\n\n"
+        "Bu test 4 bo'limdan iborat:\n"
+        "1. Writing (Task 1 + Task 2)\n"
+        "2. Speaking (Part 1, 2, 3)\n"
+        "3. Reading\n"
+        "4. Listening\n\n"
+        "⏱ Taxminiy vaqt: 2-3 soat\n\n"
+        "Hozircha alohida bo'limlardan foydalaning. "
+        "Mock test tez orada qo'shiladi!",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()

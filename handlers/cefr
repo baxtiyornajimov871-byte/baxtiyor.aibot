@@ -1,0 +1,155 @@
+# handlers/cefr.py — CEFR handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.test_service import evaluate_cefr_writing, get_test_history
+from ai_router import ai_router
+from keyboards import cefr_menu, back_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class CEFRStates(StatesGroup):
+    waiting_response = State()
+    test_type = State()
+
+
+@router.message(F.text == "📚 CEFR")
+async def show_cefr_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📚 *CEFR Darajalari*", parse_mode="Markdown", reply_markup=cefr_menu())
+
+
+@router.callback_query(F.data.in_({"cefr_test", "cefr_grammar", "cefr_vocabulary", "cefr_reading", "cefr_speaking", "cefr_writing"}))
+async def start_cefr_test(callback: CallbackQuery, state: FSMContext):
+    type_map = {
+        "cefr_test": "full",
+        "cefr_grammar": "grammar",
+        "cefr_vocabulary": "vocabulary",
+        "cefr_reading": "reading",
+        "cefr_speaking": "speaking",
+        "cefr_writing": "writing",
+    }
+    test_type = type_map[callback.data]
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    # Test savol yaratish
+    prompts = {
+        "full": "Create a comprehensive CEFR level test with: 5 grammar questions, 5 vocabulary questions, and a short reading passage with 3 questions. Include answers at the end.",
+        "grammar": "Create 10 CEFR grammar questions covering A1-C1 levels. Include multiple choice options and answers.",
+        "vocabulary": "Create 10 CEFR vocabulary questions. Mix gap-fill and multiple choice. Include answers.",
+        "reading": "Create a 150-word reading passage with 5 comprehension questions. Include answers.",
+        "speaking": "Give me 5 CEFR speaking prompts (from A2 to C1 level) that I can respond to in writing to assess my level.",
+        "writing": "Give me a CEFR writing task (B1-B2 level): write 150-200 words on a given topic.",
+    }
+
+    await callback.message.edit_text("⏳ Test tayyorlanmoqda...")
+
+    prompt = prompts.get(test_type, prompts["full"])
+    try:
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="fast",
+            user_id=user.id,
+        )
+        await state.update_data(test_type=test_type, test_content=response)
+        await state.set_state(CEFRStates.waiting_response)
+
+        await callback.message.edit_text(
+            f"📚 *CEFR Test — {test_type.title()}*\n\n{response}\n\n"
+            f"📝 Javoblaringizni yuboring. "
+            f"Men CEFR darajangizni aniqlayman.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("back_main"),
+        )
+    except Exception as e:
+        logger.error(f"CEFR test error: {e}")
+        await callback.message.edit_text("❌ Test yaratishda xatolik.", reply_markup=cefr_menu())
+    
+    await callback.answer()
+
+
+@router.message(CEFRStates.waiting_response, F.text)
+async def evaluate_cefr_response(message: Message, state: FSMContext):
+    data = await state.get_data()
+    test_type = data.get("test_type", "writing")
+    user_response = message.text
+
+    await message.answer("⏳ Darajangiz aniqlanmoqda...")
+
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            result = await evaluate_cefr_writing(db, user, user_response, test_type)
+
+        level = result.get("estimated_level", "B1")
+        confidence = result.get("confidence", "medium")
+        strengths = result.get("strengths", [])
+        weaknesses = result.get("weaknesses", [])
+        explanation = result.get("explanation", "")
+        next_target = result.get("next_target", "")
+        study_plan = result.get("study_plan", [])
+
+        text = f"""📚 *CEFR Natija*
+{'─' * 35}
+🎯 *Hozirgi daraja:* {level}
+📊 Ishonch darajasi: {confidence}
+
+💪 *Kuchli tomonlar:*
+{chr(10).join(f'  ✅ {s}' for s in strengths) or '  —'}
+
+⚠️ *Zaif tomonlar:*
+{chr(10).join(f'  ❌ {w}' for w in weaknesses) or '  —'}
+
+💬 *Tushuntirish:*
+{explanation}
+
+🎯 *Keyingi maqsad:* {next_target}
+
+📅 *O'rganish rejasi:*
+{chr(10).join(f'  {i+1}. {p}' for i, p in enumerate(study_plan)) or '  —'}
+"""
+        await message.answer(text, parse_mode="Markdown", reply_markup=cefr_menu())
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"CEFR evaluation error: {e}")
+        await message.answer("❌ Baholashda xatolik.", reply_markup=cefr_menu())
+        await state.clear()
+
+
+@router.callback_query(F.data == "cefr_progress")
+async def show_cefr_progress(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        history = await get_test_history(db, user, "CEFR")
+
+    if not history:
+        await callback.message.edit_text(
+            "📈 Hali CEFR tarixi yo'q.",
+            reply_markup=back_keyboard("back_main"),
+        )
+        await callback.answer()
+        return
+
+    text = "📈 *CEFR Progress:*\n\n"
+    for t in history:
+        date = t.created_at.strftime("%d.%m.%Y")
+        text += f"📅 {date}: *{t.estimated_level}* ({t.section})\n"
+
+    text += f"\n🎯 *Hozirgi daraja:* {user.current_level}"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_main"),
+    )
+    await callback.answer()

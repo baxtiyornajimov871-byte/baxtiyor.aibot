@@ -1,0 +1,173 @@
+# models.py — SQLAlchemy ORM modellari
+from datetime import datetime
+from sqlalchemy import (
+    Column, Integer, BigInteger, String, Boolean, Float,
+    DateTime, Text, ForeignKey, JSON
+)
+from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
+    username = Column(String(100), nullable=True)
+    first_name = Column(String(100), nullable=True)
+    last_name = Column(String(100), nullable=True)
+    preferred_language = Column(String(10), default="uz")
+    target_exam = Column(String(20), default="IELTS")
+    target_score = Column(String(20), default="6.5")
+    current_level = Column(String(20), default="B1")
+    selected_voice_gender = Column(String(10), default="female")
+    voice_reply_enabled = Column(Boolean, default=False)
+    ai_mode = Column(String(20), default="fast")  # fast | strong | economy
+    memory_summary = Column(Text, default="")
+    interests = Column(Text, default="")
+    weak_areas = Column(Text, default="")
+    strong_areas = Column(Text, default="")
+    is_blocked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    memories = relationship("UserMemory", back_populates="user", cascade="all, delete-orphan")
+    messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
+    writing_attempts = relationship("WritingAttempt", back_populates="user", cascade="all, delete-orphan")
+    speaking_attempts = relationship("SpeakingAttempt", back_populates="user", cascade="all, delete-orphan")
+    vocabulary_words = relationship("VocabularyWord", back_populates="user", cascade="all, delete-orphan")
+    test_results = relationship("TestResult", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserMemory(Base):
+    __tablename__ = "user_memory"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    key = Column(String(100), nullable=False)
+    value = Column(Text, nullable=False)
+    category = Column(String(50), default="general")
+    confidence = Column(Float, default=1.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="memories")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String(20), nullable=False)  # user | assistant | system
+    content = Column(Text, nullable=False)
+    message_type = Column(String(20), default="text")  # text | voice | image
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="messages")
+
+
+class WritingAttempt(Base):
+    __tablename__ = "writing_attempts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    exam_type = Column(String(20), default="IELTS")
+    task_type = Column(String(30), nullable=True)  # task1_academic | task1_general | task2
+    prompt = Column(Text, nullable=True)
+    essay_text = Column(Text, nullable=False)
+    estimated_score = Column(Float, nullable=True)
+    task_response_score = Column(Float, nullable=True)
+    coherence_score = Column(Float, nullable=True)
+    lexical_score = Column(Float, nullable=True)
+    grammar_score = Column(Float, nullable=True)
+    mistakes_json = Column(JSON, default=list)
+    improvements_json = Column(JSON, default=list)
+    feedback = Column(Text, nullable=True)
+    improved_version = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="writing_attempts")
+
+
+class SpeakingAttempt(Base):
+    __tablename__ = "speaking_attempts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    exam_type = Column(String(20), default="IELTS")
+    question = Column(Text, nullable=True)
+    transcript = Column(Text, nullable=True)
+    estimated_score = Column(Float, nullable=True)
+    fluency_score = Column(Float, nullable=True)
+    vocabulary_score = Column(Float, nullable=True)
+    grammar_score = Column(Float, nullable=True)
+    pronunciation_score = Column(Float, nullable=True)
+    pronunciation_mistakes_json = Column(JSON, default=list)
+    grammar_mistakes_json = Column(JSON, default=list)
+    feedback = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="speaking_attempts")
+
+
+class VocabularyWord(Base):
+    __tablename__ = "vocabulary"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    word = Column(String(200), nullable=False)
+    translation = Column(String(200), nullable=True)
+    language = Column(String(10), default="en")
+    example_sentence = Column(Text, nullable=True)
+    example_translation = Column(Text, nullable=True)
+    part_of_speech = Column(String(30), nullable=True)
+    difficulty = Column(String(20), default="medium")
+    cefr_level = Column(String(5), nullable=True)
+    review_count = Column(Integer, default=0)
+    saved_at = Column(DateTime, default=datetime.utcnow)
+    last_reviewed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="vocabulary_words")
+
+
+class TestResult(Base):
+    __tablename__ = "test_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    test_type = Column(String(30), nullable=False)  # IELTS | CEFR | CAT
+    section = Column(String(30), nullable=True)  # writing | speaking | reading | listening
+    score = Column(Float, nullable=True)
+    estimated_level = Column(String(20), nullable=True)
+    answers_json = Column(JSON, default=dict)
+    feedback = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="test_results")
+
+
+class UsageLog(Base):
+    __tablename__ = "usage_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(100), nullable=False)
+    tokens_used = Column(Integer, default=0)
+    api_key_used = Column(String(10), nullable=True)
+    status = Column(String(20), default="success")
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FeedbackMessage(Base):
+    __tablename__ = "feedback_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

@@ -1,0 +1,48 @@
+# database.py — Asinxron ma'lumotlar bazasi ulanishi
+import logging
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.pool import StaticPool
+from config import config
+from models import Base
+
+logger = logging.getLogger(__name__)
+
+# SQLite uchun maxsus sozlamalar, PostgreSQL uchun oddiy
+def build_engine():
+    db_url = config.DATABASE_URL
+    
+    # SQLite fallback
+    if db_url.startswith("sqlite"):
+        if "aiosqlite" not in db_url:
+            db_url = db_url.replace("sqlite://", "sqlite+aiosqlite://")
+        return create_async_engine(
+            db_url,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            echo=False,
+        )
+    
+    # PostgreSQL
+    if db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    
+    return create_async_engine(db_url, echo=False, pool_size=10, max_overflow=20)
+
+
+engine = build_engine()
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def init_db():
+    """Barcha jadvalni yaratadi (agar mavjud bo'lmasa)."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("✅ Database initialized successfully.")
+
+
+async def get_db() -> AsyncSession:
+    """Dependency injection uchun session beradi."""
+    async with AsyncSessionLocal() as session:
+        yield session

@@ -6,15 +6,15 @@ load_dotenv()
 
 class Config:
     # Telegram
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN")
     
     # Database
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
     
     # AI API Keys
-    AI_API_KEY_1: str = os.getenv("AI_API_KEY_1", "")
-    AI_API_KEY_2: str = os.getenv("AI_API_KEY_2", "")
-    AI_API_KEY_3: str = os.getenv("AI_API_KEY_3", "")
+    AI_API_KEY_1: str = os.getenv("AI_API_KEY_1" )
+    AI_API_KEY_2: str = os.getenv("AI_API_KEY_2" )
+    AI_API_KEY_3: str = os.getenv("AI_API_KEY_3")
     
     # AI Models
     AI_MODEL_FAST: str = os.getenv("AI_MODEL_FAST", "gpt-4o-mini")

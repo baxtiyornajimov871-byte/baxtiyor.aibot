@@ -1,0 +1,239 @@
+# handlers/settings.py — Sozlamalar handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user, update_user_field
+from services.memory_service import delete_all_memories
+from keyboards import (
+    settings_menu, language_keyboard, target_exam_keyboard,
+    ielts_score_keyboard, cefr_level_keyboard, ai_mode_keyboard,
+    voice_settings_keyboard, confirm_keyboard, back_keyboard,
+)
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+@router.message(F.text == "⚙️ Settings")
+@router.callback_query(F.data == "back_settings")
+async def show_settings(update, state: FSMContext):
+    await state.clear()
+    if isinstance(update, Message):
+        await update.answer("⚙️ *Sozlamalar*", parse_mode="Markdown", reply_markup=settings_menu())
+    else:
+        await update.message.edit_text("⚙️ *Sozlamalar*", parse_mode="Markdown", reply_markup=settings_menu())
+        await update.answer()
+
+
+@router.callback_query(F.data == "settings_language")
+async def settings_language(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🌍 *Til tanlang:*",
+        parse_mode="Markdown",
+        reply_markup=language_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_lang:"))
+async def set_language(callback: CallbackQuery):
+    lang = callback.data.split(":")[1]
+    lang_names = {"uz": "O'zbek", "en": "English", "ru": "Русский"}
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        await update_user_field(db, user, preferred_language=lang)
+
+    await callback.message.edit_text(
+        f"✅ Til o'zgartirildi: *{lang_names.get(lang, lang)}*",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_settings"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_target_exam")
+async def settings_target_exam(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎯 *Maqsadli imtihonni tanlang:*",
+        parse_mode="Markdown",
+        reply_markup=target_exam_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_exam:"))
+async def set_exam(callback: CallbackQuery):
+    exam = callback.data.split(":")[1]
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        await update_user_field(db, user, target_exam=exam)
+
+    await callback.message.edit_text(
+        f"✅ Maqsad o'zgartirildi: *{exam}*",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_settings"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_target_score")
+async def settings_target_score(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+    
+    if user.target_exam == "IELTS":
+        kb = ielts_score_keyboard()
+        text = "🏆 *IELTS ball maqsadini tanlang:*"
+    else:
+        kb = cefr_level_keyboard()
+        text = "🏆 *CEFR darajani tanlang:*"
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_score:"))
+async def set_score(callback: CallbackQuery):
+    score = callback.data.split(":")[1]
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        await update_user_field(db, user, target_score=score)
+
+    await callback.message.edit_text(
+        f"✅ Maqsad ball o'zgartirildi: *{score}*",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_settings"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"settings_voice", "settings_voice_from_main"}))
+@router.message(F.text == "🎙 Voice Settings")
+async def show_voice_settings(update, state: FSMContext):
+    if isinstance(update, CallbackQuery):
+        tg_user = update.from_user
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, tg_user)
+        kb = voice_settings_keyboard(user.voice_reply_enabled, user.selected_voice_gender)
+        await update.message.edit_text(
+            "🎙 *Ovoz sozlamalari:*",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        await update.answer()
+    else:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, update.from_user)
+        kb = voice_settings_keyboard(user.voice_reply_enabled, user.selected_voice_gender)
+        await update.answer(
+            "🎙 *Ovoz sozlamalari:*",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+
+@router.callback_query(F.data == "voice_toggle")
+async def toggle_voice(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        new_state = not user.voice_reply_enabled
+        await update_user_field(db, user, voice_reply_enabled=new_state)
+
+    status = "✅ yoqildi" if new_state else "❌ o'chirildi"
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+    kb = voice_settings_keyboard(user.voice_reply_enabled, user.selected_voice_gender)
+    await callback.message.edit_text(
+        f"🎙 Ovozli javob {status}\n\n*Ovoz sozlamalari:*",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"voice_male", "voice_female"}))
+async def set_voice_gender(callback: CallbackQuery):
+    gender = "male" if callback.data == "voice_male" else "female"
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        await update_user_field(db, user, selected_voice_gender=gender)
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+    kb = voice_settings_keyboard(user.voice_reply_enabled, user.selected_voice_gender)
+    await callback.message.edit_text(
+        f"✅ Ovoz: *{'Erkak' if gender == 'male' else 'Ayol'}*\n\n*Ovoz sozlamalari:*",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "voice_test")
+async def test_voice(callback: CallbackQuery):
+    from services.voice_service import voice_service
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    await callback.answer("🔊 Ovoz tayyorlanmoqda...")
+
+    audio_path = await voice_service.text_to_speech(
+        "Hello! This is a test voice message from Baxtiyor AI.",
+        voice_gender=user.selected_voice_gender,
+    )
+    if audio_path:
+        try:
+            with open(audio_path, "rb") as f:
+                await callback.message.answer_voice(f, caption="🎧 Test ovoz")
+        finally:
+            voice_service.cleanup_file(audio_path)
+    else:
+        await callback.message.answer(
+            "❌ TTS API sozlanmagan. .env faylida TTS_API_KEY ni kiriting."
+        )
+
+
+@router.callback_query(F.data == "settings_ai_mode")
+async def settings_ai_mode(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🧠 *AI rejimini tanlang:*\n\n"
+        "⚡ Fast — tez, arzon\n"
+        "🧠 Strong — kuchli, aniq\n"
+        "💰 Economy — juda arzon",
+        parse_mode="Markdown",
+        reply_markup=ai_mode_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_aimode:"))
+async def set_ai_mode(callback: CallbackQuery):
+    mode = callback.data.split(":")[1]
+    mode_names = {"fast": "⚡ Fast", "strong": "🧠 Strong", "economy": "💰 Economy"}
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        await update_user_field(db, user, ai_mode=mode)
+
+    await callback.message.edit_text(
+        f"✅ AI rejim: *{mode_names.get(mode, mode)}*",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_settings"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings_reset_memory")
+async def settings_reset_memory(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "⚠️ *Xotirani o'chirish*\n\n"
+        "Barcha saqlangan ma'lumotlar o'chiriladi.\n"
+        "Bu amalni qaytarib bo'lmaydi!",
+        parse_mode="Markdown",
+        reply_markup=confirm_keyboard("forget_memory"),
+    )
+    await callback.answer()

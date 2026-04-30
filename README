@@ -1,0 +1,93 @@
+# 🤖 Baxtiyor AI — IELTS/CEFR Telegram Bot
+
+Shaxsiy ingliz tili va IELTS/CEFR mentor Telegram bot.
+
+## 🚀 Xususiyatlar
+
+- 🧠 AI Chat (shaxsiy xotira bilan)
+- 📝 IELTS Writing baholash (band score)
+- 🗣 IELTS Speaking baholash (ovozdan)
+- 🎧 IELTS Listening mashqlari
+- 📖 IELTS Reading mashqlari
+- 📚 CEFR daraja testi (A1-C2)
+- 🧪 CAT adaptiv joylashish testi
+- 🔄 Ingliz ↔ O'zbek tarjima
+- 📖 So'z tushuntirish (CEFR, IELTS usefulness)
+- ⭐ Shaxsiy lug'at va quiz
+- 🎙 Ovozli javob (STT/TTS)
+- 📈 Progress kuzatuv
+- 👨‍💼 Admin panel
+
+---
+
+## 📦 O'rnatish
+
+### 1. Loyihani yuklab oling
+
+```bash
+git clone https://github.com/yourusername/baxtiyor-ai-bot.git
+cd baxtiyor-ai-bot
+```
+
+### 2. Virtual muhit yarating
+
+```bash
+python -m venv venv
+source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate      # Windows
+```
+
+### 3. Kutubxonalarni o'rnating
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. .env faylini sozlang
+
+```bash
+cp .env.example .env
+```
+
+Keyin `.env` faylini oching va quyidagilarni to'ldiring:
+
+- `BOT_TOKEN` — [@BotFather](https://t.me/BotFather) dan oling
+- `AI_API_KEY_1` — OpenAI API key (yoki boshqa OpenAI-compatible)
+- `ADMIN_IDS` — Sizning Telegram ID ingiz
+
+### 5. Botni ishga tushiring
+
+```bash
+python bot.py
+```
+
+---
+
+## ☁️ Render.com ga deploy qilish
+
+### 1. GitHub ga push qiling
+
+```bash
+git add .
+git commit -m "Initial commit"
+git push
+```
+
+### 2. Render.com da yangi Web Service yarating
+
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `python bot.py`
+- Environment: Python 3.11
+
+### 3. Environment Variables qo'shing
+
+Render dashboard > Environment bo'limida barcha `.env` o'zgaruvchilarini qo'shing.
+
+### 4. PostgreSQL qo'shing (ixtiyoriy)
+
+Render > New PostgreSQL > yarating.
+`DATABASE_URL` ni Render bergan Internal Database URL ga o'zgartiring.
+
+---
+
+## 🗂 Loyiha tuzilishi

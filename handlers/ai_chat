@@ -1,0 +1,145 @@
+# handlers/ai_chat.py — AI chat handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user, get_user_profile_dict
+from services.memory_service import (
+    save_chat_message, get_recent_messages, extract_and_save_memory
+)
+from services.voice_service import voice_service
+from ai_router import ai_router
+from prompts import get_system_prompt
+from keyboards import back_keyboard, main_menu_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class ChatStates(StatesGroup):
+    in_chat = State()
+
+
+@router.message(F.text == "🧠 AI Chat")
+async def enter_ai_chat(message: Message, state: FSMContext):
+    await state.set_state(ChatStates.in_chat)
+    await message.answer(
+        "🧠 *AI Chat rejimi*\n\n"
+        "Menga ingliz tili, IELTS, CEFR, grammatika yoki boshqa savollar bo'yicha murojaat qiling.\n"
+        "Ovozli xabar ham yubora olasiz!\n\n"
+        "Chiqish uchun /start yozing.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(ChatStates.in_chat, F.text)
+async def handle_chat_message(message: Message, state: FSMContext):
+    user_text = message.text
+
+    # /start bilan chiqish
+    if user_text.startswith("/"):
+        await state.clear()
+        return
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, message.from_user)
+        profile = await get_user_profile_dict(user)
+
+        # Xabarni saqlash
+        await save_chat_message(db, user, "user", user_text)
+
+        # Oxirgi xabarlarni olish
+        history = await get_recent_messages(db, user, limit=15)
+
+    # AI javob
+    try:
+        system_prompt = get_system_prompt(profile)
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+
+        response = await ai_router.chat(
+            messages,
+            mode=profile.get("ai_mode", "fast"),
+            user_id=user.id,
+        )
+
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            await save_chat_message(db, user, "assistant", response)
+            # Muhim faktlarni xotiraga saqlash
+            await extract_and_save_memory(db, user, user_text)
+
+        # Javob yuborish
+        await message.answer(response, parse_mode="Markdown")
+
+        # Agar ovozli javob yoqilgan bo'lsa
+        if profile.get("voice_reply_enabled"):
+            audio_path = await voice_service.text_to_speech(
+                response[:1000],  # Uzun bo'lsa qisqartirish
+                voice_gender=profile.get("selected_voice_gender", "female"),
+            )
+            if audio_path:
+                try:
+                    with open(audio_path, "rb") as f:
+                        await message.answer_voice(f)
+                finally:
+                    voice_service.cleanup_file(audio_path)
+
+    except Exception as e:
+        logger.error(f"AI chat error: {e}")
+        await message.answer(
+            "😔 Xatolik yuz berdi. Iltimos, keyinroq qayta urinib ko'ring.",
+        )
+
+
+@router.message(ChatStates.in_chat, F.voice)
+async def handle_voice_in_chat(message: Message, state: FSMContext):
+    """Chat rejimida ovozli xabar."""
+    await message.answer("🎙 Ovoz qabul qilindi, tahlil qilinmoqda...")
+
+    # Yuklab olish
+    audio_path = await voice_service.download_telegram_voice(
+        message.bot, message.voice.file_id
+    )
+    if not audio_path:
+        await message.answer("❌ Ovozni yuklab bo'lmadi.")
+        return
+
+    try:
+        # STT
+        transcript = await voice_service.speech_to_text(audio_path)
+        voice_service.cleanup_file(audio_path)
+
+        if not transcript or transcript.startswith("["):
+            await message.answer(f"❌ Ovozni matnga aylantirib bo'lmadi.\n{transcript}")
+            return
+
+        await message.answer(f"📝 *Transcript:*\n_{transcript}_", parse_mode="Markdown")
+
+        # AI javob
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            profile = await get_user_profile_dict(user)
+            await save_chat_message(db, user, "user", transcript, "voice")
+            history = await get_recent_messages(db, user, limit=10)
+
+        system_prompt = get_system_prompt(profile)
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+
+        response = await ai_router.chat(messages, mode=profile.get("ai_mode", "fast"), user_id=user.id)
+
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            await save_chat_message(db, user, "assistant", response)
+
+        await message.answer(response, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Voice chat error: {e}")
+        await message.answer("❌ Xatolik yuz berdi.")
+    finally:
+        voice_service.cleanup_file(audio_path)

@@ -1,0 +1,164 @@
+# services/test_service.py — CEFR va CAT test xizmatlari
+import logging
+import json
+import random
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from models import User, TestResult
+from ai_router import ai_router
+from prompts import CEFR_EVALUATOR, CAT_QUESTION_GENERATOR
+
+logger = logging.getLogger(__name__)
+
+CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
+CEFR_LEVEL_INDEX = {level: i for i, level in enumerate(CEFR_LEVELS)}
+
+
+async def generate_cat_question(
+    section: str = "grammar",
+    difficulty: int = 5,
+    level: str = "B1",
+    user_id: int = None,
+) -> dict:
+    """CAT test savol yaratadi."""
+    prompt = CAT_QUESTION_GENERATOR.format(
+        difficulty=difficulty,
+        section=section,
+        level=level,
+    )
+    response = await ai_router.chat(
+        [{"role": "user", "content": prompt}],
+        mode="fast",
+        user_id=user_id,
+        json_mode=True,
+    )
+    result = await ai_router.parse_json_response(response)
+    return result
+
+
+async def evaluate_cefr_writing(
+    db: AsyncSession,
+    user: User,
+    response_text: str,
+    test_type: str = "writing",
+) -> dict:
+    """Foydalanuvchi yozmasini CEFR darajasiga qarab baholaydi."""
+    prompt = CEFR_EVALUATOR.format(response=response_text, test_type=test_type)
+
+    ai_response = await ai_router.chat_strong(
+        [{"role": "user", "content": prompt}],
+        user_id=user.id,
+        json_mode=True,
+    )
+    result = await ai_router.parse_json_response(ai_response)
+
+    # Natijani saqlash
+    test = TestResult(
+        user_id=user.id,
+        test_type="CEFR",
+        section=test_type,
+        score=None,
+        estimated_level=result.get("estimated_level"),
+        answers_json={"response": response_text},
+        feedback=result.get("explanation", ""),
+    )
+    db.add(test)
+
+    # User darajasini yangilash
+    est_level = result.get("estimated_level")
+    if est_level and est_level in CEFR_LEVELS:
+        user.current_level = est_level
+    await db.commit()
+
+    return result
+
+
+class CATSession:
+    """CAT test sessiyasini boshqaradi."""
+
+    def __init__(self, section: str = "grammar", user_level: str = "B1"):
+        self.section = section
+        self.questions_asked = 0
+        self.correct = 0
+        self.wrong = 0
+        self.current_difficulty = 5
+        self.answers = []
+        self.level_estimate = user_level
+        self.max_questions = 10
+
+    def is_finished(self) -> bool:
+        return self.questions_asked >= self.max_questions
+
+    def update(self, is_correct: bool, question: dict):
+        self.questions_asked += 1
+        self.answers.append({
+            "question": question.get("question"),
+            "correct": is_correct,
+            "difficulty": self.current_difficulty,
+        })
+        if is_correct:
+            self.correct += 1
+            self.current_difficulty = min(10, self.current_difficulty + 1)
+        else:
+            self.wrong += 1
+            self.current_difficulty = max(1, self.current_difficulty - 1)
+
+    def get_final_result(self) -> dict:
+        accuracy = self.correct / max(self.questions_asked, 1)
+        score_percent = round(accuracy * 100)
+
+        # Darajani hisoblash
+        avg_diff = sum(a["difficulty"] for a in self.answers) / max(len(self.answers), 1)
+        
+        if avg_diff >= 8.5:
+            cefr = "C1"
+            ielts_equiv = "7.0-8.0"
+        elif avg_diff >= 7.0:
+            cefr = "B2"
+            ielts_equiv = "5.5-6.5"
+        elif avg_diff >= 5.0:
+            cefr = "B1"
+            ielts_equiv = "4.5-5.5"
+        elif avg_diff >= 3.0:
+            cefr = "A2"
+            ielts_equiv = "3.0-4.0"
+        else:
+            cefr = "A1"
+            ielts_equiv = "2.0-3.0"
+
+        return {
+            "total_questions": self.questions_asked,
+            "correct": self.correct,
+            "wrong": self.wrong,
+            "score_percent": score_percent,
+            "estimated_cefr": cefr,
+            "estimated_ielts": ielts_equiv,
+            "answers": self.answers,
+        }
+
+
+async def save_test_result(db: AsyncSession, user: User, result: dict, test_type: str = "CAT") -> TestResult:
+    test = TestResult(
+        user_id=user.id,
+        test_type=test_type,
+        score=result.get("score_percent"),
+        estimated_level=result.get("estimated_cefr"),
+        answers_json=result,
+        feedback=result.get("feedback", ""),
+    )
+    db.add(test)
+    
+    # Darajani yangilash
+    if result.get("estimated_cefr"):
+        user.current_level = result["estimated_cefr"]
+    await db.commit()
+    return test
+
+
+async def get_test_history(db: AsyncSession, user: User, test_type: str = None, limit: int = 10) -> list[TestResult]:
+    query = select(TestResult).where(TestResult.user_id == user.id)
+    if test_type:
+        query = query.where(TestResult.test_type == test_type)
+    query = query.order_by(TestResult.created_at.desc()).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()

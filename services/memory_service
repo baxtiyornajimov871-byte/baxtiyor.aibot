@@ -1,0 +1,177 @@
+# services/memory_service.py — Foydalanuvchi xotira tizimi
+import logging
+import json
+from datetime import datetime
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+from models import User, UserMemory, ChatMessage
+from ai_router import ai_router
+from prompts import MEMORY_EXTRACTOR
+
+logger = logging.getLogger(__name__)
+
+MAX_CHAT_HISTORY = 20  # Kontekst uchun saqlanadiyan xabarlar soni
+
+
+async def save_chat_message(db: AsyncSession, user: User, role: str, content: str, message_type: str = "text"):
+    """Chat xabarini saqlaydi."""
+    msg = ChatMessage(
+        user_id=user.id,
+        role=role,
+        content=content,
+        message_type=message_type,
+    )
+    db.add(msg)
+    await db.commit()
+
+
+async def get_recent_messages(db: AsyncSession, user: User, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
+    """So'nggi chat xabarlarini qaytaradi."""
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.user_id == user.id)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(limit)
+    )
+    messages = result.scalars().all()
+    messages.reverse()
+    return [{"role": m.role, "content": m.content} for m in messages]
+
+
+async def extract_and_save_memory(db: AsyncSession, user: User, user_message: str):
+    """Foydalanuvchi xabaridan muhim faktlarni ajratadi va saqlaydi."""
+    try:
+        prompt = MEMORY_EXTRACTOR.format(message=user_message)
+        response = await ai_router.chat(
+            [{"role": "user", "content": prompt}],
+            mode="economy",
+            user_id=user.id,
+            json_mode=True,
+        )
+        
+        # JSON parse
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            cleaned = "\n".join(lines[1:-1])
+        
+        facts = json.loads(cleaned)
+        
+        if not isinstance(facts, list):
+            return
+
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            key = fact.get("key", "").strip()
+            value = fact.get("value", "").strip()
+            category = fact.get("category", "general")
+
+            if not key or not value:
+                continue
+
+            await upsert_memory(db, user, key, value, category)
+
+        # User modelini ham yangilash
+        await _sync_memory_to_user(db, user, facts)
+
+    except Exception as e:
+        logger.error(f"Memory extraction error: {e}")
+
+
+async def upsert_memory(
+    db: AsyncSession,
+    user: User,
+    key: str,
+    value: str,
+    category: str = "general",
+    confidence: float = 1.0,
+):
+    """Xotirani yangilaydi yoki yangi qo'shadi."""
+    result = await db.execute(
+        select(UserMemory).where(
+            UserMemory.user_id == user.id,
+            UserMemory.key == key,
+        )
+    )
+    memory = result.scalar_one_or_none()
+
+    if memory:
+        memory.value = value
+        memory.updated_at = datetime.utcnow()
+    else:
+        memory = UserMemory(
+            user_id=user.id,
+            key=key,
+            value=value,
+            category=category,
+            confidence=confidence,
+        )
+        db.add(memory)
+
+    await db.commit()
+
+
+async def get_all_memories(db: AsyncSession, user: User) -> list[UserMemory]:
+    result = await db.execute(
+        select(UserMemory).where(UserMemory.user_id == user.id)
+        .order_by(UserMemory.category, UserMemory.key)
+    )
+    return result.scalars().all()
+
+
+async def delete_all_memories(db: AsyncSession, user: User):
+    """Barcha xotirani o'chiradi."""
+    await db.execute(
+        delete(UserMemory).where(UserMemory.user_id == user.id)
+    )
+    await db.execute(
+        delete(ChatMessage).where(ChatMessage.user_id == user.id)
+    )
+    # User maydonlarini reset
+    user.memory_summary = ""
+    user.interests = ""
+    user.weak_areas = ""
+    user.strong_areas = ""
+    user.updated_at = datetime.utcnow()
+    await db.commit()
+    logger.info(f"Memory deleted for user {user.id}")
+
+
+async def build_memory_summary(db: AsyncSession, user: User) -> str:
+    """Xotiradan qisqacha xulosa chiqaradi."""
+    memories = await get_all_memories(db, user)
+    if not memories:
+        return ""
+    lines = []
+    for m in memories:
+        lines.append(f"{m.key}: {m.value}")
+    return "\n".join(lines[:30])
+
+
+async def _sync_memory_to_user(db: AsyncSession, user: User, facts: list[dict]):
+    """Asosiy faktlarni User modeliga ham saqlaydi."""
+    changed = False
+    for fact in facts:
+        key = fact.get("key", "")
+        value = fact.get("value", "")
+        if key == "interests" and value:
+            user.interests = value
+            changed = True
+        elif key == "target_score" and value:
+            user.target_score = value
+            changed = True
+        elif key in ("weakness", "weak_area") and value:
+            existing = user.weak_areas or ""
+            if value not in existing:
+                user.weak_areas = f"{existing}, {value}".strip(", ")
+            changed = True
+        elif key in ("strength", "strong_area") and value:
+            existing = user.strong_areas or ""
+            if value not in existing:
+                user.strong_areas = f"{existing}, {value}".strip(", ")
+            changed = True
+
+    if changed:
+        user.updated_at = datetime.utcnow()
+        await db.commit()

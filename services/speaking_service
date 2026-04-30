@@ -1,0 +1,169 @@
+# services/speaking_service.py — IELTS Speaking baholash
+import logging
+import json
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from models import User, SpeakingAttempt
+from ai_router import ai_router
+from prompts import IELTS_SPEAKING_EVALUATOR
+from services.memory_service import upsert_memory
+
+logger = logging.getLogger(__name__)
+
+SPEAKING_QUESTIONS = {
+    "part1": [
+        "Tell me about your hometown. What do you like about it?",
+        "Do you work or study? What do you enjoy about it?",
+        "What are your hobbies? How often do you do them?",
+        "Describe your daily routine.",
+        "What kind of music do you like? Why?",
+        "Do you enjoy cooking? Why or why not?",
+        "How do you usually spend your weekends?",
+        "What sports do you enjoy watching or playing?",
+    ],
+    "part2": [
+        "Describe a book you have recently read. You should say: what it was about, why you chose it, what you liked or disliked, and explain how it affected you.",
+        "Describe a place you would like to visit. You should say: where it is, why you want to go there, what you would do there, and explain why this place is special to you.",
+        "Describe a person who has influenced you greatly. You should say: who this person is, how you know them, what they are like, and explain how they have influenced you.",
+        "Describe an important decision you made in your life. You should say: what the decision was, how you made it, what happened as a result, and explain if it was the right decision.",
+    ],
+    "part3": [
+        "Do you think people read less nowadays? Why?",
+        "How has technology changed the way people communicate?",
+        "Do you think environmental problems can be solved? How?",
+        "What are the advantages and disadvantages of living in a big city?",
+        "How important is education for success in life?",
+    ],
+}
+
+
+async def get_speaking_question(part: str = "part1") -> str:
+    """Tasodifiy speaking savol beradi."""
+    import random
+    questions = SPEAKING_QUESTIONS.get(part, SPEAKING_QUESTIONS["part1"])
+    return random.choice(questions)
+
+
+async def evaluate_speaking(
+    db: AsyncSession,
+    user: User,
+    transcript: str,
+    question: str = "",
+) -> dict:
+    """IELTS speaking javobini baholaydi."""
+
+    prev = await get_last_speaking_attempt(db, user)
+    prev_score = prev.estimated_score if prev else "N/A"
+    prev_mistakes = json.dumps(prev.pronunciation_mistakes_json) if prev and prev.pronunciation_mistakes_json else "[]"
+
+    prompt = IELTS_SPEAKING_EVALUATOR.format(
+        question=question or "General speaking question",
+        transcript=transcript,
+        prev_score=prev_score,
+        prev_mistakes=prev_mistakes,
+    )
+
+    response = await ai_router.chat_strong(
+        [{"role": "user", "content": prompt}],
+        user_id=user.id,
+        json_mode=True,
+    )
+
+    result = await ai_router.parse_json_response(response)
+
+    # Saqlash
+    attempt = SpeakingAttempt(
+        user_id=user.id,
+        exam_type="IELTS",
+        question=question,
+        transcript=transcript,
+        estimated_score=result.get("estimated_score"),
+        fluency_score=result.get("fluency_score"),
+        vocabulary_score=result.get("vocabulary_score"),
+        grammar_score=result.get("grammar_score"),
+        pronunciation_score=result.get("pronunciation_score"),
+        pronunciation_mistakes_json=result.get("pronunciation_notes", []),
+        grammar_mistakes_json=result.get("grammar_mistakes", []),
+        feedback=result.get("feedback"),
+    )
+    db.add(attempt)
+    await db.commit()
+
+    # Xotira yangilash
+    score = result.get("estimated_score", 0)
+    await upsert_memory(db, user, "last_speaking_score", str(score), "score")
+
+    result["previous_score"] = prev_score
+    return result
+
+
+async def get_last_speaking_attempt(db: AsyncSession, user: User) -> SpeakingAttempt | None:
+    result = await db.execute(
+        select(SpeakingAttempt)
+        .where(SpeakingAttempt.user_id == user.id)
+        .order_by(SpeakingAttempt.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_speaking_history(db: AsyncSession, user: User, limit: int = 10) -> list[SpeakingAttempt]:
+    result = await db.execute(
+        select(SpeakingAttempt)
+        .where(SpeakingAttempt.user_id == user.id)
+        .order_by(SpeakingAttempt.created_at.desc())
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+def format_speaking_result(result: dict) -> str:
+    score = result.get("estimated_score", "N/A")
+    fluency = result.get("fluency_score", "N/A")
+    vocab = result.get("vocabulary_score", "N/A")
+    grammar = result.get("grammar_score", "N/A")
+    pron = result.get("pronunciation_score", "N/A")
+    prev = result.get("previous_score", "N/A")
+
+    improvement_text = ""
+    if prev != "N/A" and isinstance(score, (int, float)):
+        diff = round(float(score) - float(prev), 1)
+        sign = "+" if diff >= 0 else ""
+        improvement_text = f"\n📊 Oldingi: {prev} → Hozir: {score} ({sign}{diff})"
+
+    grammar_mistakes = result.get("grammar_mistakes", [])
+    gm_text = "\n".join([f"  • {m}" for m in grammar_mistakes[:3]]) or "  Topilmadi"
+
+    pron_notes = result.get("pronunciation_notes", [])
+    pn_text = "\n".join([f"  • {n}" for n in pron_notes[:3]]) or "  Topilmadi"
+
+    phrases = result.get("suggested_phrases", [])
+    ph_text = "\n".join([f"  📌 {p}" for p in phrases[:3]]) or "  —"
+
+    return f"""🗣 *IELTS Speaking Natija*
+{'─' * 35}
+🏆 *Umumiy ball:* {score}/9.0
+🌊 Fluency & Coherence: {fluency}
+📚 Lexical Resource: {vocab}
+📐 Grammar: {grammar}
+🔊 Pronunciation: {pron}
+{improvement_text}
+
+📝 *Transcript:*
+_{result.get('transcript', '')[:300]}..._
+
+❌ *Grammar xatolari:*
+{gm_text}
+
+🔊 *Talaffuz eslatmalari:*
+{pn_text}
+
+💡 *Tavsiya etilgan iboralar:*
+{ph_text}
+
+✅ *Model javob:*
+{result.get('better_version', '')[:400]}
+
+💬 *Baho:*
+{result.get('feedback', '')}
+"""

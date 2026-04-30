@@ -1,0 +1,154 @@
+# services/voice_service.py — STT va TTS xizmatlari
+import logging
+import os
+import tempfile
+import asyncio
+from pathlib import Path
+import httpx
+from config import config
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceService:
+    """
+    Speech-to-Text va Text-to-Speech xizmatlari.
+    OpenAI Whisper (STT) va OpenAI TTS dan foydalanadi.
+    """
+
+    def __init__(self):
+        self.stt_key = config.STT_API_KEY or config.AI_API_KEY_1
+        self.tts_key = config.TTS_API_KEY or config.AI_API_KEY_1
+        self.base_url = config.AI_BASE_URL
+
+    async def speech_to_text(self, audio_file_path: str, language: str = "en") -> str:
+        """
+        Audio faylni matnga aylantiradi.
+        OpenAI Whisper API ishlatadi.
+        """
+        if not self.stt_key:
+            logger.warning("STT API key not configured.")
+            return "[STT not configured. Please add STT_API_KEY to .env]"
+
+        try:
+            # TODO: Agar boshqa STT provider kerak bo'lsa, shu yerda almashtiring
+            # (Google Speech-to-Text, Azure, Deepgram, etc.)
+            
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                with open(audio_file_path, "rb") as f:
+                    files = {"file": ("audio.ogg", f, "audio/ogg")}
+                    data = {
+                        "model": "whisper-1",
+                        "language": language,
+                    }
+                    headers = {"Authorization": f"Bearer {self.stt_key}"}
+                    
+                    # OpenAI Whisper endpoint
+                    base = self.base_url.rstrip("/")
+                    response = await client.post(
+                        f"{base}/audio/transcriptions",
+                        headers=headers,
+                        files=files,
+                        data=data,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    transcript = result.get("text", "").strip()
+                    logger.info(f"STT result: {transcript[:100]}")
+                    return transcript
+
+        except Exception as e:
+            logger.error(f"STT error: {e}")
+            return f"[Ovozni matnga aylantirish xatosi: {str(e)[:100]}]"
+
+    async def text_to_speech(
+        self,
+        text: str,
+        voice_gender: str = "female",
+        output_path: str = None,
+    ) -> str | None:
+        """
+        Matnni ovozga aylantiradi.
+        OpenAI TTS API ishlatadi.
+        Returns: path to audio file, or None if failed.
+        """
+        if not self.tts_key:
+            logger.warning("TTS API key not configured.")
+            return None
+
+        # Ovoz tanlash (OpenAI)
+        voice_map = {
+            "female": "nova",
+            "male": "onyx",
+        }
+        voice = voice_map.get(voice_gender, "nova")
+
+        try:
+            if not output_path:
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".mp3", delete=False, dir="/tmp"
+                )
+                output_path = tmp.name
+                tmp.close()
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                payload = {
+                    "model": "tts-1",
+                    "input": text[:4096],  # OpenAI limit
+                    "voice": voice,
+                    "response_format": "mp3",
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.tts_key}",
+                    "Content-Type": "application/json",
+                }
+                base = self.base_url.rstrip("/")
+                response = await client.post(
+                    f"{base}/audio/speech",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+
+                with open(output_path, "wb") as f:
+                    f.write(response.content)
+
+            logger.info(f"TTS generated: {output_path}")
+            return output_path
+
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            return None
+
+    async def download_telegram_voice(
+        self,
+        bot,
+        file_id: str,
+        save_dir: str = "/tmp",
+    ) -> str | None:
+        """Telegram voice xabarini yuklab oladi."""
+        try:
+            file = await bot.get_file(file_id)
+            file_path = file.file_path
+            
+            local_path = os.path.join(save_dir, f"{file_id}.ogg")
+            await bot.download_file(file_path, local_path)
+            
+            logger.info(f"Voice downloaded: {local_path}")
+            return local_path
+
+        except Exception as e:
+            logger.error(f"Voice download error: {e}")
+            return None
+
+    def cleanup_file(self, file_path: str):
+        """Vaqtinchalik faylni o'chiradi."""
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.error(f"File cleanup error: {e}")
+
+
+# Global instance
+voice_service = VoiceService()

@@ -1,0 +1,278 @@
+# handlers/vocabulary.py — Vocabulary handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.vocabulary_service import (
+    get_saved_words, get_words_for_review, get_word_count,
+    mark_word_reviewed, generate_quiz_question, export_vocabulary_text, delete_word,
+)
+from keyboards import vocabulary_menu, quiz_options_keyboard, back_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class VocabStates(StatesGroup):
+    quiz_active = State()
+    review_active = State()
+
+
+@router.message(F.text == "⭐ My Vocabulary")
+@router.callback_query(F.data == "vocab_list")
+async def show_vocabulary(update, state: FSMContext):
+    await state.clear()
+    if isinstance(update, CallbackQuery):
+        tg_user = update.from_user
+        msg = update.message
+    else:
+        tg_user = update.from_user
+        msg = update
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, tg_user)
+        words = await get_saved_words(db, user, limit=20)
+        count = await get_word_count(db, user)
+
+    if not words:
+        text = (
+            "📚 *Mening lug'atim*\n\n"
+            "Hali so'z saqlanmagan.\n"
+            "Lug'at bo'limidan so'z saqlang! ⭐"
+        )
+    else:
+        text = f"📚 *Mening lug'atim* ({count} ta so'z)\n\n"
+        for i, w in enumerate(words, 1):
+            text += f"{i}. *{w.word}*"
+            if w.translation:
+                text += f" — {w.translation}"
+            if w.cefr_level:
+                text += f" `[{w.cefr_level}]`"
+            text += "\n"
+
+    if isinstance(update, CallbackQuery):
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=vocabulary_menu())
+        await update.answer()
+    else:
+        await msg.answer(text, parse_mode="Markdown", reply_markup=vocabulary_menu())
+
+
+@router.callback_query(F.data == "vocab_review")
+async def start_review(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        words = await get_words_for_review(db, user, limit=10)
+
+    if not words:
+        await callback.message.edit_text(
+            "📅 Ko'rib chiqiladigan so'z yo'q. Yangi so'zlar saqlang!",
+            reply_markup=vocabulary_menu(),
+        )
+        await callback.answer()
+        return
+
+    await state.update_data(review_words=[w.id for w in words], review_index=0)
+    await state.set_state(VocabStates.review_active)
+    
+    word = words[0]
+    await callback.message.edit_text(
+        f"📅 *Ko'rib chiqish* (1/{len(words)})\n\n"
+        f"🇬🇧 *{word.word}*\n"
+        f"Bu so'zning ma'nosini bilasizmi?\n\n"
+        f"Javobingizni yozing yoki /skip deb o'ting.",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("vocab_list"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "vocab_quiz")
+async def start_quiz(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        words = await get_words_for_review(db, user, limit=5)
+
+    if len(words) < 2:
+        await callback.message.edit_text(
+            "🧠 Quiz uchun kamida 2 ta so'z kerak. Ko'proq so'z saqlang!",
+            reply_markup=vocabulary_menu(),
+        )
+        await callback.answer()
+        return
+
+    word = words[0]
+    await state.update_data(
+        quiz_words=[w.id for w in words],
+        quiz_index=0,
+        quiz_score=0,
+        current_word_id=word.id,
+        current_word=word.word,
+        correct_answer=word.translation,
+    )
+    await state.set_state(VocabStates.quiz_active)
+
+    try:
+        quiz = await generate_quiz_question(word)
+        options = quiz.get("shuffled_options", [word.translation, "wrong1", "wrong2", "wrong3"])
+        
+        await callback.message.edit_text(
+            f"🧠 *Quiz* (1/{len(words)})\n\n"
+            f"❓ *{quiz.get('question', f'What does \"{word.word}\" mean?')}*",
+            parse_mode="Markdown",
+            reply_markup=quiz_options_keyboard(options[:4], 1),
+        )
+        await state.update_data(quiz_data=quiz)
+    except Exception as e:
+        logger.error(f"Quiz error: {e}")
+        await callback.message.edit_text("❌ Quiz yaratishda xatolik.", reply_markup=vocabulary_menu())
+        await state.clear()
+
+    await callback.answer()
+
+
+@router.callback_query(VocabStates.quiz_active, F.data.startswith("quiz_answer:"))
+async def handle_quiz_answer(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    chosen_index = int(parts[2]) if len(parts) > 2 else 0
+    data = await state.get_data()
+    quiz_data = data.get("quiz_data", {})
+    options = quiz_data.get("shuffled_options", [])
+    correct = data.get("correct_answer", "")
+
+    if options and chosen_index < len(options):
+        chosen = options[chosen_index]
+        is_correct = chosen.lower().strip() == correct.lower().strip()
+    else:
+        is_correct = False
+
+    score = data.get("quiz_score", 0) + (1 if is_correct else 0)
+    
+    if is_correct:
+        feedback = f"✅ To'g'ri!"
+    else:
+        feedback = f"❌ Noto'g'ri. To'g'ri javob: *{correct}*"
+
+    if quiz_data.get("explanation"):
+        feedback += f"\n💡 {quiz_data['explanation']}"
+
+    # Mark reviewed
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        word_id = data.get("current_word_id")
+        from sqlalchemy import select
+        from models import VocabularyWord
+        result = await db.execute(
+            select(VocabularyWord).where(VocabularyWord.id == word_id)
+        )
+        word_obj = result.scalar_one_or_none()
+        if word_obj:
+            await mark_word_reviewed(db, word_obj)
+
+    quiz_words = data.get("quiz_words", [])
+    quiz_index = data.get("quiz_index", 0) + 1
+    
+    if quiz_index >= len(quiz_words):
+        # Quiz tugadi
+        await callback.message.edit_text(
+            f"{feedback}\n\n"
+            f"🏁 *Quiz tugadi!*\n"
+            f"Natija: {score}/{len(quiz_words)} ✅",
+            parse_mode="Markdown",
+            reply_markup=vocabulary_menu(),
+        )
+        await state.clear()
+    else:
+        await callback.message.edit_text(
+            f"{feedback}\n\nKeyingi savol yuklanmoqda...",
+            parse_mode="Markdown",
+        )
+        await state.update_data(quiz_score=score, quiz_index=quiz_index)
+        # Next word
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, callback.from_user)
+            next_word_id = quiz_words[quiz_index]
+            from sqlalchemy import select
+            from models import VocabularyWord
+            result = await db.execute(
+                select(VocabularyWord).where(VocabularyWord.id == next_word_id)
+            )
+            next_word = result.scalar_one_or_none()
+        
+        if next_word:
+            try:
+                quiz = await generate_quiz_question(next_word)
+                options = quiz.get("shuffled_options", [next_word.translation])
+                await state.update_data(
+                    current_word_id=next_word.id,
+                    current_word=next_word.word,
+                    correct_answer=next_word.translation,
+                    quiz_data=quiz,
+                )
+                await callback.message.answer(
+                    f"🧠 *Quiz* ({quiz_index+1}/{len(quiz_words)})\n\n"
+                    f"❓ *{quiz.get('question')}*",
+                    parse_mode="Markdown",
+                    reply_markup=quiz_options_keyboard(options[:4], quiz_index+1),
+                )
+            except Exception as e:
+                logger.error(f"Next quiz error: {e}")
+                await state.clear()
+
+    await callback.answer()
+
+
+@router.callback_query(F.data == "vocab_export")
+async def export_vocab(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        text = await export_vocabulary_text(db, user)
+
+    # Fayl sifatida yuborish
+    import io
+    file_content = text.encode("utf-8")
+    file = io.BytesIO(file_content)
+    file.name = "my_vocabulary.txt"
+    
+    await callback.message.answer_document(
+        file,
+        caption="📤 Sizning lug'atingiz eksport qilindi.",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "vocab_difficult")
+async def show_difficult_words(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        from sqlalchemy import select
+        from models import VocabularyWord
+        result = await db.execute(
+            select(VocabularyWord)
+            .where(VocabularyWord.user_id == user.id, VocabularyWord.review_count == 0)
+            .order_by(VocabularyWord.saved_at.desc())
+            .limit(10)
+        )
+        words = result.scalars().all()
+
+    if not words:
+        await callback.message.edit_text(
+            "🎉 Hamma so'zlar ko'rib chiqilgan!",
+            reply_markup=vocabulary_menu(),
+        )
+        await callback.answer()
+        return
+
+    text = "❗ *Ko'rib chiqilmagan so'zlar:*\n\n"
+    for i, w in enumerate(words, 1):
+        text += f"{i}. *{w.word}* — {w.translation or '?'}\n"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=vocabulary_menu(),
+    )
+    await callback.answer()

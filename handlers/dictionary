@@ -1,0 +1,209 @@
+# handlers/dictionary.py — Lug'at va tarjima handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.translator_service import (
+    translate_text, explain_word, format_translation, format_word_explanation, detect_language
+)
+from services.vocabulary_service import save_word
+from services.voice_service import voice_service
+from keyboards import dictionary_menu, word_action_keyboard, back_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class DictStates(StatesGroup):
+    waiting_translate = State()
+    waiting_word = State()
+    waiting_en_uz = State()
+    waiting_uz_en = State()
+    waiting_auto = State()
+
+
+@router.message(F.text == "📚 Dictionary")
+@router.callback_query(F.data == "back_dict")
+async def show_dict_menu(update, state: FSMContext):
+    await state.clear()
+    if isinstance(update, Message):
+        await update.answer("📚 *Lug'at va Tarjima*", parse_mode="Markdown", reply_markup=dictionary_menu())
+    else:
+        await update.message.edit_text("📚 *Lug'at va Tarjima*", parse_mode="Markdown", reply_markup=dictionary_menu())
+        await update.answer()
+
+
+@router.callback_query(F.data == "dict_translate")
+async def dict_translate(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DictStates.waiting_translate)
+    await callback.message.edit_text(
+        "🔄 *Tarjima*\n\nMatnni yuboring (avtomatik til aniqlanadi):",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_dict"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dict_explain")
+async def dict_explain(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DictStates.waiting_word)
+    await callback.message.edit_text(
+        "💡 *So'z tushuntirish*\n\nSo'z yoki iborani yuboring:",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_dict"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dict_en_uz")
+async def dict_en_uz(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DictStates.waiting_en_uz)
+    await callback.message.edit_text(
+        "🇬🇧 *English → Uzbek*\n\nInglizcha matnni yuboring:",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_dict"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dict_uz_en")
+async def dict_uz_en(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DictStates.waiting_uz_en)
+    await callback.message.edit_text(
+        "🇺🇿 *Uzbek → English*\n\nO'zbekcha matnni yuboring:",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_dict"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dict_auto")
+async def dict_auto(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(DictStates.waiting_auto)
+    await callback.message.edit_text(
+        "🔍 *Auto Detect*\n\nMatn yuboring — tilni o'zim aniqlayman:",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_dict"),
+    )
+    await callback.answer()
+
+
+@router.message(DictStates.waiting_translate)
+@router.message(DictStates.waiting_auto)
+async def handle_auto_translate(message: Message, state: FSMContext):
+    text = message.text
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, message.from_user)
+
+    try:
+        result = await translate_text(text, user_id=user.id)
+        formatted = format_translation(result)
+        await message.answer(formatted, parse_mode="Markdown", reply_markup=dictionary_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        await message.answer("❌ Tarjimada xatolik.", reply_markup=dictionary_menu())
+        await state.clear()
+
+
+@router.message(DictStates.waiting_en_uz)
+async def handle_en_uz(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, message.from_user)
+    try:
+        result = await translate_text(message.text, "en", "uz", user_id=user.id)
+        await message.answer(format_translation(result), parse_mode="Markdown", reply_markup=dictionary_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(e)
+        await message.answer("❌ Xatolik.", reply_markup=dictionary_menu())
+        await state.clear()
+
+
+@router.message(DictStates.waiting_uz_en)
+async def handle_uz_en(message: Message, state: FSMContext):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, message.from_user)
+    try:
+        result = await translate_text(message.text, "uz", "en", user_id=user.id)
+        await message.answer(format_translation(result), parse_mode="Markdown", reply_markup=dictionary_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(e)
+        await message.answer("❌ Xatolik.", reply_markup=dictionary_menu())
+        await state.clear()
+
+
+@router.message(DictStates.waiting_word)
+async def handle_word_explain(message: Message, state: FSMContext):
+    word = message.text.strip()
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, message.from_user)
+
+    await message.answer("⏳ So'z tahlil qilinmoqda...")
+
+    try:
+        result = await explain_word(word, user_id=user.id)
+        # Word data ni state ga saqlash (save uchun)
+        await state.update_data(
+            last_word=result.get("word", word),
+            last_translation=result.get("translation_uz", ""),
+            last_example_en=result.get("example_en", ""),
+            last_example_uz=result.get("example_uz", ""),
+            last_pos=result.get("part_of_speech", ""),
+            last_cefr=result.get("cefr_level", ""),
+        )
+        
+        formatted = format_word_explanation(result)
+        await message.answer(
+            formatted,
+            parse_mode="Markdown",
+            reply_markup=word_action_keyboard(result.get("word", word)),
+        )
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"Word explain error: {e}")
+        await message.answer("❌ So'zni tushuntirishda xatolik.", reply_markup=dictionary_menu())
+        await state.clear()
+
+
+@router.callback_query(F.data.startswith("save_word:"))
+async def save_word_handler(callback: CallbackQuery, state: FSMContext):
+    word = callback.data.split(":", 1)[1].replace("_", " ")
+
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        vocab = await save_word(db, user, word)
+
+    if vocab:
+        await callback.answer(f"⭐ '{word}' lug'atga saqlandi!", show_alert=False)
+    else:
+        await callback.answer("So'z allaqachon saqlangan.", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("listen_word:"))
+async def listen_word_handler(callback: CallbackQuery):
+    word = callback.data.split(":", 1)[1].replace("_", " ")
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+
+    await callback.answer("🔊 Ovoz tayyorlanmoqda...")
+
+    audio_path = await voice_service.text_to_speech(
+        word,
+        voice_gender=user.selected_voice_gender,
+    )
+    if audio_path:
+        try:
+            with open(audio_path, "rb") as f:
+                await callback.message.answer_voice(f, caption=f"🔊 {word}")
+        finally:
+            voice_service.cleanup_file(audio_path)
+    else:
+        await callback.message.answer("❌ Ovoz yaratib bo'lmadi. TTS sozlamalari kerak.")

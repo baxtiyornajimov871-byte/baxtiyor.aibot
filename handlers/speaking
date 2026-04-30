@@ -1,0 +1,170 @@
+# handlers/speaking.py — IELTS Speaking handler
+import logging
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from database import AsyncSessionLocal
+from services.user_service import get_or_create_user
+from services.speaking_service import (
+    evaluate_speaking, get_speaking_question, get_speaking_history,
+    format_speaking_result,
+)
+from services.voice_service import voice_service
+from keyboards import speaking_menu, back_keyboard
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class SpeakingStates(StatesGroup):
+    waiting_voice = State()
+    part_type = State()
+
+
+@router.message(F.text == "🗣 Speaking Practice")
+@router.callback_query(F.data == "ielts_speaking")
+async def show_speaking_menu(update, state: FSMContext):
+    await state.clear()
+    if isinstance(update, Message):
+        await update.answer("🗣 *IELTS Speaking*", parse_mode="Markdown", reply_markup=speaking_menu())
+    else:
+        await update.message.edit_text("🗣 *IELTS Speaking*", parse_mode="Markdown", reply_markup=speaking_menu())
+        await update.answer()
+
+
+@router.callback_query(F.data.in_({"speaking_part1", "speaking_part2", "speaking_part3"}))
+async def start_speaking_part(callback: CallbackQuery, state: FSMContext):
+    part_map = {
+        "speaking_part1": "part1",
+        "speaking_part2": "part2",
+        "speaking_part3": "part3",
+    }
+    part = part_map[callback.data]
+    question = await get_speaking_question(part)
+
+    await state.update_data(question=question, part=part)
+    await state.set_state(SpeakingStates.waiting_voice)
+
+    part_names = {"part1": "Part 1", "part2": "Part 2 (Cue Card)", "part3": "Part 3"}
+
+    await callback.message.edit_text(
+        f"🗣 *IELTS Speaking — {part_names[part]}*\n\n"
+        f"❓ *Savol:*\n{question}\n\n"
+        f"🎙 Ovozli xabar yuboring. "
+        f"(Part 2 uchun 1-2 daqiqa gapiring)",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "speaking_check")
+async def speaking_check_mode(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(question="Free speaking check", part="part1")
+    await state.set_state(SpeakingStates.waiting_voice)
+    await callback.message.edit_text(
+        "🎙 *Speaking tekshirish*\n\n"
+        "Ovozli xabar yuboring — IELTS mezonlari bo'yicha baholayman.",
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
+
+
+@router.message(SpeakingStates.waiting_voice, F.voice)
+async def receive_voice_answer(message: Message, state: FSMContext):
+    await message.answer("🎙 Ovoz qabul qilindi, tahlil qilinmoqda...")
+
+    data = await state.get_data()
+    question = data.get("question", "")
+
+    # Yuklab olish
+    audio_path = await voice_service.download_telegram_voice(
+        message.bot, message.voice.file_id
+    )
+    if not audio_path:
+        await message.answer("❌ Ovozni yuklab bo'lmadi. Qayta urinib ko'ring.")
+        return
+
+    try:
+        # STT
+        transcript = await voice_service.speech_to_text(audio_path)
+        voice_service.cleanup_file(audio_path)
+
+        if not transcript or transcript.startswith("["):
+            await message.answer(f"❌ Ovozni matnga aylantirib bo'lmadi.\n{transcript}")
+            return
+
+        await message.answer(f"📝 *Transcript:*\n_{transcript}_", parse_mode="Markdown")
+        await message.answer("⏳ Baholanmoqda...")
+
+        # Baholash
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            result = await evaluate_speaking(db, user, transcript, question)
+
+        result["transcript"] = transcript
+        text = format_speaking_result(result)
+        await message.answer(text, parse_mode="Markdown", reply_markup=speaking_menu())
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"Speaking evaluation error: {e}")
+        await message.answer("❌ Xatolik yuz berdi.", reply_markup=speaking_menu())
+        await state.clear()
+    finally:
+        if audio_path:
+            voice_service.cleanup_file(audio_path)
+
+
+@router.message(SpeakingStates.waiting_voice, F.text)
+async def speaking_text_fallback(message: Message, state: FSMContext):
+    """Matn kelsa, text sifatida baholash."""
+    data = await state.get_data()
+    question = data.get("question", "")
+    transcript = message.text
+
+    await message.answer("📝 Matn qabul qilindi, baholanmoqda...")
+
+    try:
+        async with AsyncSessionLocal() as db:
+            user = await get_or_create_user(db, message.from_user)
+            result = await evaluate_speaking(db, user, transcript, question)
+
+        result["transcript"] = transcript
+        text = format_speaking_result(result)
+        await message.answer(text, parse_mode="Markdown", reply_markup=speaking_menu())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Speaking text evaluation error: {e}")
+        await message.answer("❌ Xatolik.", reply_markup=speaking_menu())
+        await state.clear()
+
+
+@router.callback_query(F.data == "speaking_history")
+async def show_speaking_history(callback: CallbackQuery):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(db, callback.from_user)
+        history = await get_speaking_history(db, user)
+
+    if not history:
+        await callback.message.edit_text(
+            "📜 Hali speaking tarixi yo'q.",
+            reply_markup=back_keyboard("back_ielts"),
+        )
+        await callback.answer()
+        return
+
+    text = "📜 *Speaking tarixi:*\n\n"
+    for i, attempt in enumerate(history, 1):
+        date = attempt.created_at.strftime("%d.%m.%Y")
+        text += f"{i}. {date} — 🏆 {attempt.estimated_score}/9.0\n"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=back_keyboard("back_ielts"),
+    )
+    await callback.answer()
